@@ -29,6 +29,7 @@ A single `scan`:
    | `suggested.cil` | real, missing rules — safe to install |
    | `app-review.cil` | app / oplus-source noise (sockets, probes, property reads) — visible so you decide |
    | `constraint.cil` | **already allowed but still denied** → an MLS category or file-label problem, not a missing allow |
+   | `constraint-fix.cil` | ready `mlstrustedsubject` lines for the sources in `constraint.cil` that are blocked by MLS categories (e.g. a touch HAL reading per-app data) — opt-in |
    | `risky.cil` | SELinux-weakening denials (setenforce, execmem…) — never auto-added |
    | `other.cil` | out-of-scope sources (third-party apps, unrelated daemons), tagged |
 4. Builds `out.cil` = installed policy + the approved rules.
@@ -63,7 +64,13 @@ adb push denial-review.sh /data/local/tmp/denial-review.sh
 adb shell su -c "sh /data/local/tmp/denial-review.sh scan"
 # review/trim /data/local/tmp/seclic-review/suggested.cil, then:
 adb shell su -c "sh /data/local/tmp/denial-review.sh build"
+# to also apply the MLS mlstrustedsubject fix for HALs blocked by categories:
+adb shell su -c "sh /data/local/tmp/denial-review.sh build /data/local/tmp/seclic-review/constraint-fix.cil"
 ```
+
+`build` takes optional extra `.cil` files; whatever you pass is appended to the
+candidate alongside `suggested.cil` and compile-checked. That is how you opt
+into `constraint-fix.cil` (or any hand-written rules).
 
 When it reports `out.cil ... PASS`, it prints the exact commands to back up,
 install and reboot. Example install (run them yourself):
@@ -93,10 +100,11 @@ Put these before `scan` / `build`:
 - Install from `suggested.cil` (trim first if you like). Those are the only
   rules that go into `out.cil`.
 - `constraint.cil` denials are **not fixed by an allow** — your policy already
-  allows the type. Fix them by relabelling the target in `*_file_contexts`, or,
-  only if the domain must cross app MLS categories, by making it
-  `mlstrustedsubject` (the script writes that line commented out, because it
-  weakens MLS separation).
+  allows the type. They are blocked by an MLS category or a wrong file label.
+  For the category cases the script writes a ready `mlstrustedsubject` line to
+  `constraint-fix.cil`; apply it with `build <that file>` if the domain really
+  must cross app categories (it weakens MLS separation, so review first). For
+  label cases, relabel the target in `*_file_contexts` instead.
 - A service running with **no denials** (common for gameopt) means SELinux is
   not its problem; look at the service's own logs.
 

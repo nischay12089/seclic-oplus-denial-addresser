@@ -141,9 +141,11 @@ classify() {
     {
         if (!match($0, /denied +\{[^}]*\}/)) next
         p = substr($0, RSTART, RLENGTH); sub(/^denied +\{ */, "", p); sub(/ *\}$/, "", p)
-        if (!match($0, /scontext=[^ ]+/)) next; split(substr($0, RSTART+9, RLENGTH-9), a, ":"); s = a[3]
-        if (!match($0, /tcontext=[^ ]+/)) next; split(substr($0, RSTART+9, RLENGTH-9), b, ":"); t = b[3]
+        if (!match($0, /scontext=[^ ]+/)) next; ns = split(substr($0, RSTART+9, RLENGTH-9), a, ":"); s = a[3]
+        if (!match($0, /tcontext=[^ ]+/)) next; nt = split(substr($0, RSTART+9, RLENGTH-9), b, ":"); t = b[3]
         if (!match($0, /tclass=[^ ]+/)) next; c = substr($0, RSTART+7, RLENGTH-7); gsub(/[^a-z_0-9]/, "", c)
+        # MLS mismatch: target carries categories the source lacks (s0 vs s0:c..).
+        if (nt >= 5 && ns < 5) CATMISS[s] = 1
         if (c == "file" && isprop(t) && !((s "/" t) in SEENPT)) { SEENPT[s "/" t] = 1; NPROP[s]++ }
         np = split(p, pp, " ")
         for (i = 1; i <= np; i++) {
@@ -171,7 +173,10 @@ classify() {
             # allow. It is an MLS category or file-label constraint; record it so
             # it is visible, with the fix that actually applies.
             if ((rs "/" rt "/" c "/" perm) in COV || (rt == "self" && (rs "/self/" c "/" perm) in COV)) {
-                if (scope) { CON[rs SUBSEP rt SUBSEP c] = CON[rs SUBSEP rt SUBSEP c] " " perm; CSEEN[rs SUBSEP rt SUBSEP c] = 1; csrc[rs] = 1 }
+                if (scope) {
+                    CON[rs SUBSEP rt SUBSEP c] = CON[rs SUBSEP rt SUBSEP c] " " perm; CSEEN[rs SUBSEP rt SUBSEP c] = 1; csrc[rs] = 1
+                    if (CATMISS[s]) MLSFIX[rs] = 1     # blocked by MLS categories -> mlstrustedsubject fixes it
+                }
                 continue
             }
 
@@ -224,8 +229,17 @@ classify() {
         print ";;     making it mlstrustedsubject (RISKY -- it then ignores MLS)." > CONF
         for (k in CSEEN) { split(k, g, SUBSEP); print ";; recurring: " g[1] " -> " g[2] " " g[3] " {" substr(CON[k],2) "}" > CONF }
         for (k in CSEEN) nc++
-        print "" > CONF; print ";; mlstrustedsubject option (uncomment only if you accept the risk):" > CONF
-        for (o in csrc) { print ";; (typeattributeset mlstrustedsubject (" o "))" > CONF; ncs++ }
+        # Ready-to-apply MLS fix for sources blocked by category separation.
+        nmls = 0
+        print ";; mlstrustedsubject fix for sources blocked by MLS categories" > CONFIX
+        print ";; (these were ALREADY type-allowed but denied because the target" > CONFIX
+        print ";;  carried app categories the source lacked). Applying this lets the" > CONFIX
+        print ";;  domain cross MLS categories -- correct for a vendor HAL that must" > CONFIX
+        print ";;  read per-app data (adbd, dumpstate, bluetooth etc are the same)," > CONFIX
+        print ";;  but it DOES weaken category separation, so review each line." > CONFIX
+        for (o in MLSFIX) { print "(typeattributeset mlstrustedsubject (" o "))" > CONFIX; nmls++ }
+        print "" > CONF; print ";; " nmls " source(s) are MLS-blocked; ready fix in constraint-fix.cil" > CONF
+        for (o in csrc) ncs++
 
         print "scope: " (non > 0 ? ("only [" ONLY "]") : "all sources except excluded") > REP
         print "excluded: " EXCL "  and /" EXRE "/" > REP
@@ -244,20 +258,27 @@ classify() {
     }
     ' "$WORK/allpol.txt" "$WORK/raw.txt" \
       SUG="$WORK/suggested.cil" RSK="$WORK/risky.cil" APPF="$WORK/app-review.cil" \
-      OTHF="$WORK/other.cil" CONF="$WORK/constraint.cil" REP="$WORK/report.txt"
+      OTHF="$WORK/other.cil" CONF="$WORK/constraint.cil" CONFIX="$WORK/constraint-fix.cil" REP="$WORK/report.txt"
 }
 
 # ----------------------------------------------------------- build out.cil --
+# out.cil = installed policy + suggested.cil + any extra files passed in
+# (e.g. constraint-fix.cil for the MLS mlstrustedsubject fix).
 build_out() {
     [ -s "$WORK/suggested.cil" ] || { : > "$WORK/suggested.cil"; }
     cp "$VENDOR_CIL" "$WORK/out.cil" || die "cannot read $VENDOR_CIL"
-    nnew=$(grep -c '^(allow' "$WORK/suggested.cil" 2>/dev/null) || nnew=0
-    if [ "$nnew" -gt 0 ]; then
-        echo "" >> "$WORK/out.cil"
-        echo ";; ---- reviewed denial rules added $(date) ----" >> "$WORK/out.cil"
-        grep '^(allow' "$WORK/suggested.cil" >> "$WORK/out.cil"
-    fi
-    info "out.cil = your policy + $nnew reviewed rule(s)"
+    echo "" >> "$WORK/out.cil"
+    echo ";; ---- reviewed rules added $(date) ----" >> "$WORK/out.cil"
+    nnew=0
+    for src in "$WORK/suggested.cil" "$@"; do
+        [ -s "$src" ] || continue
+        n=$(grep -cE '^\((allow|typeattributeset|allowx|typetransition)' "$src" 2>/dev/null) || n=0
+        [ "$n" -gt 0 ] || continue
+        echo ";; from $(basename "$src"):" >> "$WORK/out.cil"
+        grep -E '^\((allow|typeattributeset|allowx|typetransition)' "$src" >> "$WORK/out.cil"
+        nnew=$((nnew + n))
+    done
+    info "out.cil = your policy + $nnew reviewed rule(s)${*:+ (incl $*)}"
 }
 
 install_hint() {
@@ -279,7 +300,7 @@ case "$CMD" in
         { logcat -d -b all 2>/dev/null; dmesg 2>/dev/null; } | grep 'avc: *denied' > "$WORK/raw.txt"
         info "$(wc -l < "$WORK/raw.txt") denial lines"
         classify
-        for f in suggested risky app-review other constraint; do [ -f "$WORK/$f.cil" ] || : > "$WORK/$f.cil"; done
+        for f in suggested risky app-review other constraint constraint-fix; do [ -f "$WORK/$f.cil" ] || : > "$WORK/$f.cil"; done
         echo; cat "$WORK/report.txt"; echo
         echo "===================== NEW RULES (review!) ====================="
         cat "$WORK/suggested.cil"; [ -s "$WORK/suggested.cil" ] || echo "(none -- everything is already in your policy or was noise)"
@@ -287,11 +308,13 @@ case "$CMD" in
         build_out
         check_out && install_hint
         echo
-        echo "Edit $WORK/suggested.cil (delete lines you do not want), then: sh $0 build"
+        echo "Edit $WORK/suggested.cil, then rebuild:            sh $0 build"
+        echo "To also apply the MLS fix (constraint-fix.cil):   sh $0 build $WORK/constraint-fix.cil"
         ;;
     build)
         [ -f "$WORK/suggested.cil" ] || die "no $WORK/suggested.cil -- run 'scan' first"
-        build_out
+        shift 2>/dev/null || true
+        build_out "$@"
         check_out && install_hint
         ;;
     help|-h|--help)
